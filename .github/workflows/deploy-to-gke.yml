@@ -1,0 +1,89 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build and Deploy Recommendation Service
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "ai-demo"
+    paths:
+      - "src/recommendation/**"
+      - "elastic-ai-demo/run-demo.sh"
+      - "elastic-ai-demo/export-to-elastic.yml"
+      - ".github/workflows/deploy-to-gke.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Retrieve git metadata
+        id: git_meta
+        run: |
+          BRANCH_NAME="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          REPOSITORY_NAME="${GITHUB_REPOSITORY}"
+
+          echo "branch=${BRANCH_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "commit=${COMMIT_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "repository=${REPOSITORY_NAME}" >> "${GITHUB_OUTPUT}"
+
+          echo "Branch: ${BRANCH_NAME}"
+          echo "Commit: ${COMMIT_SHA}"
+          echo "Repository: ${REPOSITORY_NAME}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push recommendation image
+        uses: docker/build-push-action@v6.19.2
+        with:
+          context: .
+          file: ./src/recommendation/Dockerfile
+          push: true
+          tags: ghcr.io/alexanderwert/demo:latest-recommendation
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Get GKE cluster credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GKE_CLUSTER_NAME }}
+          location: ${{ secrets.GKE_CLUSTER_LOCATION }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Add OpenTelemetry Helm repository
+        run: |
+          helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+          helm repo update
+
+      - name: Deploy using run-demo script
+        working-directory: elastic-ai-demo
+        env:
+          GITHUB_SHA: ${{ steps.git_meta.outputs.commit }}
+          GITHUB_BRANCH: ${{ steps.git_meta.outputs.branch }}
+          GITHUB_REPOSITORY: ${{ steps.git_meta.outputs.repository }}
+        run: bash ./run-demo.sh
