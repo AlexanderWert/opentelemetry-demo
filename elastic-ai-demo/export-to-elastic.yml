@@ -109,11 +109,16 @@ opentelemetry-collector:
               - replace_pattern(cache["tmp"]["url.path"], "^((/[^/]+){1,2}).*$", "$1")
               - set(name, cache["tmp"]["url.path"])
               - set(name, Concat([attributes["http.method"],cache["tmp"]["url.path"]], " "))
+      filter/flagd:
+        traces:
+          span:
+            - 'name == "/flagd.evaluation.v1.Service/EventStream"'
 
     service:
       pipelines:
         traces:
           processors:
+            - filter/flagd
             - transform/span_name_from_url
             - k8sattributes
             - resourcedetection/eks
