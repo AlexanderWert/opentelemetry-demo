@@ -1,62 +1,64 @@
-#!/usr/bin/python
+# Copyright 2020 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# Copyright The OpenTelemetry Authors
-# SPDX-License-Identifier: Apache-2.0
-
-
-# Python
 import os
 import random
+import time
+import grpc
 from concurrent import futures
 
-# Pip
-import grpc
-from opentelemetry import trace, metrics
-from opentelemetry._logs import set_logger_provider
-from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
-    OTLPLogExporter,
-)
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.sdk.resources import Resource
-
-from openfeature import api
-from openfeature.contrib.provider.flagd import FlagdProvider
-
-from openfeature.contrib.hook.opentelemetry import TracingHook
-
-# Local
-import logging
 import demo_pb2
 import demo_pb2_grpc
 from grpc_health.v1 import health_pb2
 from grpc_health.v1 import health_pb2_grpc
 
-from metrics import (
+from opentelemetry import context, baggage, trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry import metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+
+from logger import getJSONLogger
+logger = getJSONLogger('recommendationservice-server')
+
+from opentelemetry_setup import (
+    init_tracer,
     init_metrics
 )
 
 
-cached_ids = []
-cached_ids_to_retrieve_recommendations_for = []
-MAX_CACHED_IDS = 2000000
-
 first_run = True
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
+
     def ListRecommendations(self, request, context):
         prod_list = get_product_list(request.product_ids)
-        span = trace.get_current_span()
-        span.set_attribute("app.products_recommended.count", len(prod_list))
-        logger.info(f"Receive ListRecommendations for product ids:{prod_list}")
+        max_responses = 5
+
+        # fetch list of products from product catalog stub
+        num_products = len(prod_list)
+        num_return = min(max_responses, num_products)
+        # sample list of indicies to return
+        indices = random.sample(range(num_products), num_return)
+        # fetch product ids from indices
+        prod_ids = [prod_list[i] for i in indices]
+        logger.info("[Recv ListRecommendations] product_ids={}".format(prod_ids))
 
         # build and return response
         response = demo_pb2.ListRecommendationsResponse()
-        response.product_ids.extend(prod_list)
-
-        # Collect metrics for this service
-        rec_svc_metrics["app_recommendations_counter"].add(len(prod_list), {'recommendation.type': 'catalog'})
-
+        response.product_ids.extend(prod_ids)
         return response
 
     def Check(self, request, context):
@@ -67,115 +69,50 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
         return health_pb2.HealthCheckResponse(
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
-def get_recommendations_ids(request_product_ids):
-    global cached_ids
-
-    with tracer.start_as_current_span("get_recommendations_ids") as span:
-        can_retrieve_from_cache = True
-        for p_id in request_product_ids:
-            if p_id not in cached_ids_to_retrieve_recommendations_for:
-                can_retrieve_from_cache = False
-
-        if not can_retrieve_from_cache:
-            logger.info("get_recommendations_ids: cache miss")
-            span.set_attribute("app.cache_hit", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            ids_to_add = []
-            for x in cat_response.products:
-                ids_to_add.extend(cached_ids)
-                ids_to_add.append(x.id)
-                if len(ids_to_add) + len(cached_ids) < MAX_CACHED_IDS:
-                    cached_ids= cached_ids + ids_to_add
-            return cached_ids
-        else:
-            logger.info("get_recommendations_ids: cache hit")
-            span.set_attribute("app.cache_hit", True)
-            return cached_ids
 
 def get_product_list(request_product_ids):
     global first_run
+
     with tracer.start_as_current_span("get_product_list") as span:
-        max_responses = 5
+        if first_run or not request_product_ids:
+            first_run = False
+        else:
+            request_product_ids_str = ''.join(request_product_ids)
+            request_product_ids = request_product_ids_str.split(',')
 
-        # Formulate the list of characters to list of strings
-        request_product_ids_str = ''.join(request_product_ids)
-        request_product_ids = request_product_ids_str.split(',')
-
-        product_ids = get_recommendations_ids(request_product_ids)
+        cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+        product_ids = [x.id for x in cat_response.products]
 
         span.set_attribute("app.products.count", len(product_ids))
 
-        # Create a filtered list of products excluding the products received as input
         filtered_products = list(set(product_ids) - set(request_product_ids))
-        num_products = len(filtered_products)
-        span.set_attribute("app.filtered_products.count", num_products)
-        num_return = min(max_responses, num_products)
-
-        # Sample list of indicies to return
-        indices = random.sample(range(num_products), num_return)
-        # Fetch product ids from indices
-        prod_list = [filtered_products[i] for i in indices]
-
-        span.set_attribute("app.filtered_products.list", prod_list)
-
-        return prod_list
-
-
-def must_map_env(key: str):
-    value = os.environ.get(key)
-    if value is None:
-        raise Exception(f'{key} environment variable must be set')
-    return value
-
-
-def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+        return filtered_products
 
 
 if __name__ == "__main__":
-    service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    logger.info("initializing recommendation service")
 
-    # Initialize Traces and Metrics
-    tracer = trace.get_tracer_provider().get_tracer(service_name)
-    meter = metrics.get_meter_provider().get_meter(service_name)
-    rec_svc_metrics = init_metrics(meter)
+    tracer = init_tracer('recommendation')
+    meter = init_metrics('recommendation')
 
-    # Initialize Logs
-    logger_provider = LoggerProvider(
-        resource=Resource.create(
-            {
-                'service.name': service_name,
-            }
-        ),
-    )
-    set_logger_provider(logger_provider)
-    log_exporter = OTLPLogExporter(insecure=True)
-    logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
-    handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
+    catalog_addr = os.environ.get('PRODUCT_CATALOG_SERVICE_ADDR', '')
+    if catalog_addr == '':
+        raise Exception('PRODUCT_CATALOG_SERVICE_ADDR environment variable not set')
+    logger.info("product catalog address: " + catalog_addr)
+    channel = grpc.insecure_channel(catalog_addr)
+    product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(channel)
 
-    # Attach OTLP handler to logger
-    logger = logging.getLogger('main')
-    logger.addHandler(handler)
-
-    catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
-    product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
-
-    # Create gRPC server
+    # create gRPC server
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
 
-    # Add class to gRPC server
-    service = RecommendationService()
-    demo_pb2_grpc.add_RecommendationServiceServicer_to_server(service, server)
-    health_pb2_grpc.add_HealthServicer_to_server(service, server)
+    # add class to gRPC server
+    demo_pb2_grpc.add_RecommendationServiceServicer_to_server(RecommendationService(), server)
 
-    # Start server
-    port = must_map_env('RECOMMENDATION_PORT')
-    server.add_insecure_port(f'[::]:{port}')
+    # add health checking service to gRPC server
+    health_pb2_grpc.add_HealthServicer_to_server(health_pb2.HealthServicer(), server)
+
+    port = os.environ.get('RECOMMENDATION_SERVICE_PORT', 8080)
+    logger.info("listening on port: " + str(port))
+    server.add_insecure_port('[::]:' + str(port))
     server.start()
-    logger.info(f'Recommendation service started, listening on port {port}')
     server.wait_for_termination()
