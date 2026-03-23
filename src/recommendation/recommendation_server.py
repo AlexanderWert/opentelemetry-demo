@@ -37,10 +37,6 @@ from metrics import (
 )
 
 
-cached_ids = []
-cached_ids_to_retrieve_recommendations_for = []
-MAX_CACHED_IDS = 2000000
-
 first_run = True
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
@@ -67,31 +63,6 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
         return health_pb2.HealthCheckResponse(
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
-def get_recommendations_ids(request_product_ids):
-    global cached_ids
-
-    with tracer.start_as_current_span("get_recommendations_ids") as span:
-        can_retrieve_from_cache = True
-        for p_id in request_product_ids:
-            if p_id not in cached_ids_to_retrieve_recommendations_for:
-                can_retrieve_from_cache = False
-
-        if not can_retrieve_from_cache:
-            logger.info("get_recommendations_ids: cache miss")
-            span.set_attribute("app.cache_hit", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            ids_to_add = []
-            for x in cat_response.products:
-                ids_to_add.extend(cached_ids)
-                ids_to_add.append(x.id)
-                if len(ids_to_add) + len(cached_ids) < MAX_CACHED_IDS:
-                    cached_ids= cached_ids + ids_to_add
-            return cached_ids
-        else:
-            logger.info("get_recommendations_ids: cache hit")
-            span.set_attribute("app.cache_hit", True)
-            return cached_ids
-
 def get_product_list(request_product_ids):
     global first_run
     with tracer.start_as_current_span("get_product_list") as span:
@@ -101,7 +72,8 @@ def get_product_list(request_product_ids):
         request_product_ids_str = ''.join(request_product_ids)
         request_product_ids = request_product_ids_str.split(',')
 
-        product_ids = get_recommendations_ids(request_product_ids)
+        cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+        product_ids = [x.id for x in cat_response.products]
 
         span.set_attribute("app.products.count", len(product_ids))
 
